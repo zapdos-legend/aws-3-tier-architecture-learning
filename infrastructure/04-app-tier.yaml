@@ -93,6 +93,7 @@ Resources:
   NatInstanceRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: aws-3-tier-nat-role
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -112,6 +113,7 @@ Resources:
   NatInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
+      InstanceProfileName: aws-3-tier-nat-instance-profile
       Roles: [!Ref NatInstanceRole]
 
   NatInstance:
