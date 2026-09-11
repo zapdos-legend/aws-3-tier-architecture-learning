@@ -166,6 +166,12 @@ Resources:
   # for a later lesson that adds scaling policies or raises desired capacity.
   WebAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT0S
+        WaitOnResourceSignals: false
     Properties:
       MinSize: '1'
       DesiredCapacity: '1'
