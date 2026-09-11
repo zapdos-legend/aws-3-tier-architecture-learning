@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Network infrastructure for the AWS 3-Tier Architecture Learning Project.
+  Creates one VPC and six subnets across two Availability Zones.
+
+Resources:
+
+  # ---------------------------------------------------------
+  # VPC
+  # ---------------------------------------------------------
+  ThreeTierVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-learning-vpc
+
+  # ---------------------------------------------------------
+  # PUBLIC WEB SUBNETS
+  # ---------------------------------------------------------
+  PublicWebSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-web-az1
+
+  PublicWebSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-web-az2
+
+  # ---------------------------------------------------------
+  # PRIVATE APPLICATION SUBNETS
+  # ---------------------------------------------------------
+  PrivateAppSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: private-app-az1
+
+  PrivateAppSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: private-app-az2
+
+  # ---------------------------------------------------------
+  # PRIVATE DATABASE SUBNETS
+  # ---------------------------------------------------------
+  PrivateDBSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      CidrBlock: 10.0.21.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: private-db-az1
+
+  PrivateDBSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      CidrBlock: 10.0.22.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: private-db-az2
+  # ---------------------------------------------------------
+  # INTERNET GATEWAY
+  # ---------------------------------------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-learning-igw
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------------------------------------------------
+  # PUBLIC ROUTE TABLE
+  # ---------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      Tags:
+        - Key: Name
+          Value: public-route-table
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicWebSubnetAZ1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicWebSubnetAZ1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicWebSubnetAZ2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicWebSubnetAZ2
+      RouteTableId: !Ref PublicRouteTable
+  # ---------------------------------------------------------
+  # PRIVATE APP ROUTE TABLE
+  # ---------------------------------------------------------
+  PrivateAppRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      Tags:
+        - Key: Name
+          Value: private-app-route-table
+
+  PrivateAppSubnetAZ1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetAZ1
+      RouteTableId: !Ref PrivateAppRouteTable
+
+  PrivateAppSubnetAZ2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetAZ2
+      RouteTableId: !Ref PrivateAppRouteTable
+
+  # ---------------------------------------------------------
+  # PRIVATE DB ROUTE TABLE
+  # ---------------------------------------------------------
+  PrivateDBRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ThreeTierVPC
+      Tags:
+        - Key: Name
+          Value: private-db-route-table
+
+  PrivateDBSubnetAZ1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnetAZ1
+      RouteTableId: !Ref PrivateDBRouteTable
+
+  PrivateDBSubnetAZ2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnetAZ2
+      RouteTableId: !Ref PrivateDBRouteTable
+Outputs:
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref ThreeTierVPC
+    Export:
+      Name: aws-3-tier-VpcId
+
+  PublicWebSubnetAZ1Id:
+    Description: Public Web Subnet AZ1
+    Value: !Ref PublicWebSubnetAZ1
+    Export:
+      Name: aws-3-tier-PublicWebSubnetAZ1
+
+  PublicWebSubnetAZ2Id:
+    Description: Public Web Subnet AZ2
+    Value: !Ref PublicWebSubnetAZ2
+    Export:
+      Name: aws-3-tier-PublicWebSubnetAZ2
+
+  PrivateAppSubnetAZ1Id:
+    Description: Private App Subnet AZ1
+    Value: !Ref PrivateAppSubnetAZ1
+    Export:
+      Name: aws-3-tier-PrivateAppSubnetAZ1
+
+  PrivateAppSubnetAZ2Id:
+    Description: Private App Subnet AZ2
+    Value: !Ref PrivateAppSubnetAZ2
+    Export:
+      Name: aws-3-tier-PrivateAppSubnetAZ2
+
+  PrivateDBSubnetAZ1Id:
+    Description: Private DB Subnet AZ1
+    Value: !Ref PrivateDBSubnetAZ1
+    Export:
+      Name: aws-3-tier-PrivateDBSubnetAZ1
+
+  PrivateDBSubnetAZ2Id:
+    Description: Private DB Subnet AZ2
+    Value: !Ref PrivateDBSubnetAZ2
+    Export:
+      Name: aws-3-tier-PrivateDBSubnetAZ2

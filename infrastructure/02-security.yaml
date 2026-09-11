@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Security groups for the AWS 3-Tier Architecture Learning Project.
+
+Resources:
+
+  # ---------------------------------------------------------
+  # PUBLIC LOAD BALANCER SECURITY GROUP
+  # ---------------------------------------------------------
+  PublicALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic from the internet to the public ALB
+      VpcId: !ImportValue aws-3-tier-VpcId
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+      Tags:
+        - Key: Name
+          Value: public-alb-sg
+  # ---------------------------------------------------------
+  # WEB TIER SECURITY GROUP
+  # ---------------------------------------------------------
+  WebTierSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic only from the public ALB
+      VpcId: !ImportValue aws-3-tier-VpcId
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref PublicALBSecurityGroup
+
+      Tags:
+        - Key: Name
+          Value: web-tier-sg
+  # ---------------------------------------------------------
+  # INTERNAL LOAD BALANCER SECURITY GROUP
+  # ---------------------------------------------------------
+  InternalALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow application traffic only from the web tier
+      VpcId: !ImportValue aws-3-tier-VpcId
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WebTierSecurityGroup
+
+      Tags:
+        - Key: Name
+          Value: internal-alb-sg
+  # ---------------------------------------------------------
+  # APP TIER SECURITY GROUP
+  # ---------------------------------------------------------
+  AppTierSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Node.js traffic only from the internal ALB
+      VpcId: !ImportValue aws-3-tier-VpcId
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4000
+          ToPort: 4000
+          SourceSecurityGroupId: !Ref InternalALBSecurityGroup
+
+      Tags:
+        - Key: Name
+          Value: app-tier-sg
+
+  # ---------------------------------------------------------
+  # DATABASE SECURITY GROUP
+  # ---------------------------------------------------------
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL only from the application tier
+      VpcId: !ImportValue aws-3-tier-VpcId
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppTierSecurityGroup
+
+      Tags:
+        - Key: Name
+          Value: database-sg
