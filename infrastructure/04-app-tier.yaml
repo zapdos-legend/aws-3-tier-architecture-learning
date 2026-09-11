@@ -88,6 +88,34 @@ Resources:
         - IpProtocol: '-1'
           CidrIp: 0.0.0.0/0
 
+  # The AL2023 AMI includes AWS CLI v2. Its instance role is limited to reporting
+  # this instance's bootstrap result to this stack's CreationPolicy.
+  NatInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-3-tier-nat-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SignalNatInstanceBootstrap
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Ref AWS::StackId
+
+  NatInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: aws-3-tier-nat-instance-profile
+      Roles: [!Ref NatInstanceRole]
+
   NatInstance:
     Type: AWS::EC2::Instance
     CreationPolicy:
@@ -97,6 +125,7 @@ Resources:
     Properties:
       ImageId: !Ref LatestAmiId
       InstanceType: t3.nano
+      IamInstanceProfile: !Ref NatInstanceProfile
       SourceDestCheck: false
       NetworkInterfaces:
         - AssociatePublicIpAddress: true
@@ -111,14 +140,51 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -euxo pipefail
+          signal_bootstrap_result() {
+            local exit_code=$?
+            local status=SUCCESS
+            trap - EXIT
+            if (( exit_code != 0 )); then status=FAILURE; fi
+            aws cloudformation signal-resource \
+              --stack-name ${AWS::StackName} \
+              --logical-resource-id NatInstance \
+              --unique-id "$(cat /var/lib/cloud/data/instance-id)" \
+              --status "$status" \
+              --region ${AWS::Region} || true
+            exit "$exit_code"
+          }
+          trap signal_bootstrap_result EXIT
+
           echo 'net.ipv4.ip_forward = 1' >/etc/sysctl.d/90-nat.conf
           sysctl --system
-          dnf install -y iptables-services
-          iptables -t nat -A POSTROUTING -o ens5 -j MASQUERADE
-          iptables-save >/etc/sysconfig/iptables
-          systemctl enable --now iptables
-          /opt/aws/bin/cfn-signal --exit-code $? --stack ${AWS::StackName} \
-            --resource NatInstance --region ${AWS::Region}
+          dnf install -y nftables
+          outbound_interface="$(ip -4 route show default | awk 'NR == 1 { print $5 }')"
+          test -n "$outbound_interface"
+          install -d -m 0755 /etc/nftables
+          cat >/etc/nftables/aws-3-tier-nat.conf <<EOF
+          table ip aws_3_tier_nat {
+            chain postrouting {
+              type nat hook postrouting priority srcnat; policy accept;
+              oifname "$outbound_interface" masquerade
+            }
+          }
+          EOF
+          cat >/etc/systemd/system/aws-3-tier-nat.service <<'EOF'
+          [Unit]
+          Description=AWS three-tier NAT instance masquerading
+          Wants=network-online.target
+          After=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStartPre=-/usr/sbin/nft delete table ip aws_3_tier_nat
+          ExecStart=/usr/sbin/nft -f /etc/nftables/aws-3-tier-nat.conf
+          ExecStop=/usr/sbin/nft delete table ip aws_3_tier_nat
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now aws-3-tier-nat
       Tags:
         - Key: Name
           Value: aws-3-tier-learning-nat-instance
