@@ -8,6 +8,16 @@ const con = mysql.createConnection({
     database: dbcreds.DB_DATABASE
 });
 
+// Make a fresh learning database usable without a separate manual schema step.
+con.query(`CREATE TABLE IF NOT EXISTS transactions (
+    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    amount DECIMAL(10, 2) NOT NULL,
+    description VARCHAR(255) NOT NULL
+)`, function(err) {
+    if (err) throw err;
+    console.log('transactions table is ready');
+});
+
 function addTransaction(amount,desc){
     var mysql = `INSERT INTO \`transactions\` (\`amount\`, \`description\`) VALUES ('${amount}','${desc}')`;
     con.query(mysql, function(err,result){
@@ -55,8 +65,6 @@ function deleteTransactionById(id, callback){
 
 
 module.exports = {addTransaction ,getAllTransactions, deleteAllTransactions, deleteAllTransactions, findTransactionById, deleteTransactionById};
-
-
 
 
 

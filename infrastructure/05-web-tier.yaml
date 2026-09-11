@@ -11,11 +11,9 @@ Parameters:
     Default: t3.micro
     AllowedValues: [t3.micro, t3.small]
     Description: Small burstable instance type for this learning environment.
-  WebBuildUrl:
+  ArtifactVersion:
     Type: String
-    Default: ''
-    Description: Optional HTTPS URL of a tar.gz containing the React build output (never credentials).
-    AllowedPattern: '^$|https://.*'
+    Description: Unique object version (normally the Git commit) uploaded by deploy.ps1.
   PublicALBSecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
     Description: ID of PublicALBSecurityGroup from aws-3-tier-security.
@@ -23,12 +21,8 @@ Parameters:
     Type: AWS::EC2::SecurityGroup::Id
     Description: ID of WebTierSecurityGroup from aws-3-tier-security.
 
-Conditions:
-  HasWebBuild: !Not [!Equals [!Ref WebBuildUrl, '']]
-
 Resources:
-  # The web role grants only Session Manager permissions; no S3 access is needed because
-  # an optional build artifact is fetched from the caller-provided HTTPS URL.
+  # The web role grants Session Manager plus read access to exactly one source archive.
   WebInstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -41,6 +35,22 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadWebSourceArtifact
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - ${BucketArn}/web-tier/${ArtifactVersion}.zip
+                  - BucketArn:
+                      Fn::Join:
+                        - ''
+                        - - 'arn:'
+                          - !Ref AWS::Partition
+                          - ':s3:::'
+                          - Fn::ImportValue: aws-3-tier-ApplicationArtifactsBucket
 
   WebInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -103,32 +113,52 @@ Resources:
             - |
               #!/bin/bash
               set -euxo pipefail
-              dnf install -y nginx
+              dnf install -y nginx unzip
+              curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+              dnf install -y nodejs
+              mkdir -p /opt/webapp/web-tier
+              aws s3 cp "s3://${ArtifactBucket}/web-tier/${ArtifactVersion}.zip" /tmp/web-tier.zip
+              unzip -q /tmp/web-tier.zip -d /opt/webapp/web-tier
+              cd /opt/webapp/web-tier
+              npm ci
+              # CRA 5's legacy ESLint integration is not needed for the production bundle;
+              # lint/test checks are run before deployment by this repository.
+              DISABLE_ESLINT_PLUGIN=true npm run build
               rm -rf /usr/share/nginx/html/*
-              if [[ "${HasArtifact}" == "true" ]]; then
-                curl --fail --location "${ArtifactUrl}" --output /tmp/web-build.tar.gz
-                tar -xzf /tmp/web-build.tar.gz -C /usr/share/nginx/html
-              else
-                cat >/usr/share/nginx/html/index.html <<'EOF'
-              <!doctype html><title>AWS 3-tier learning app</title><h1>Web tier is healthy</h1><p>Supply WebBuildUrl to install the React build.</p>
-              EOF
-              fi
-              cat >/etc/nginx/conf.d/webapp.conf <<'EOF'
+              cp -a build/. /usr/share/nginx/html/
+              cat >/etc/nginx/nginx.conf <<'EOF'
+              user nginx;
+              worker_processes auto;
+              error_log /var/log/nginx/error.log;
+              pid /run/nginx.pid;
+              events { worker_connections 1024; }
+              http {
+                include /etc/nginx/mime.types;
+                default_type application/octet-stream;
+                sendfile on;
               server {
-                  listen 80 default_server;
-                  server_name _;
-                  root /usr/share/nginx/html;
-                  index index.html;
-                  location = /health { default_type text/plain; return 200 'healthy\n'; }
-                  location / { try_files $uri $uri/ /index.html; }
-                  location /api/ { proxy_pass http://${InternalAlbDns}:80/; }
+                listen 80 default_server;
+                server_name _;
+                root /usr/share/nginx/html;
+                index index.html;
+                location = /health { default_type text/plain; return 200 'healthy\n'; }
+                location / { try_files $uri $uri/ /index.html; }
+                # The trailing slash deliberately strips /api/ before forwarding;
+                # /api/transaction therefore reaches the app's /transaction route.
+                location /api/ {
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_pass http://${InternalAlbDns}:80/;
+                }
+              }
               }
               EOF
               systemctl enable --now nginx
-            - HasArtifact: !If [HasWebBuild, 'true', 'false']
-              ArtifactUrl: !Ref WebBuildUrl
-              InternalAlbDns:
+            - InternalAlbDns:
                 Fn::ImportValue: aws-3-tier-InternalLoadBalancerDNSName
+              ArtifactBucket:
+                Fn::ImportValue: aws-3-tier-ApplicationArtifactsBucket
+              ArtifactVersion: !Ref ArtifactVersion
 
   # One instance is inexpensive; the launch template and two-subnet ASG are ready
   # for a later lesson that adds scaling policies or raises desired capacity.
@@ -142,6 +172,8 @@ Resources:
         - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ1
         - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ2
       TargetGroupARNs: [!Ref WebTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 1200
       LaunchTemplate:
         LaunchTemplateId: !Ref WebLaunchTemplate
         Version: !GetAtt WebLaunchTemplate.LatestVersionNumber

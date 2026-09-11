@@ -15,7 +15,7 @@ Parameters:
     NoEcho: true
     MinLength: 8
     MaxLength: 41
-    AllowedPattern: '[^/"@ ]+'
+    AllowedPattern: '[A-Za-z0-9!#$%&()*+,.\-:;<=>?_~]+'
   DBInstanceClass:
     Type: String
     Default: db.t4g.micro
@@ -26,6 +26,19 @@ Parameters:
     Description: ID of DatabaseSecurityGroup from aws-3-tier-security.
 
 Resources:
+  # The app reads this encrypted secret at boot. This avoids credentials in Git,
+  # EC2 UserData, launch templates, and command-line arguments on the instance.
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Runtime MySQL credentials for the AWS three-tier learning app
+      SecretString: !Sub '{"username":"${DBUsername}","password":"${DBPassword}"}'
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-database-credentials
+
   # RDS needs a subnet group spanning at least two Availability Zones even though
   # this first deployment intentionally creates only one database instance in one AZ.
   DatabaseSubnetGroup:
@@ -81,3 +94,8 @@ Outputs:
     Value: !GetAtt Database.Endpoint.Port
     Export:
       Name: aws-3-tier-DatabasePort
+  DatabaseSecretArn:
+    Description: Secret read by the app instance role at startup.
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: aws-3-tier-DatabaseSecretArn
