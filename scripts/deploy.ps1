@@ -120,9 +120,7 @@ try {
 
     $publicSubnet = Get-Export 'aws-3-tier-PublicWebSubnetAZ1'
     $privateSubnet1 = Get-Export 'aws-3-tier-PrivateAppSubnetAZ1'
-    $privateSubnet2 = Get-Export 'aws-3-tier-PrivateAppSubnetAZ2'
-    $privateRouteTable1 = Get-SubnetRouteTable $privateSubnet1
-    $privateRouteTable2 = Get-SubnetRouteTable $privateSubnet2
+    $privateRouteTable = Get-SubnetRouteTable $privateSubnet1
     $databaseSg = Get-StackResourceId 'aws-3-tier-security' 'DatabaseSecurityGroup'
     $internalAlbSg = Get-StackResourceId 'aws-3-tier-security' 'InternalALBSecurityGroup'
     $appSg = Get-StackResourceId 'aws-3-tier-security' 'AppTierSecurityGroup'
@@ -133,8 +131,8 @@ try {
         "DBUsername=$dbUsername", "DBPassword=$dbPassword", "DatabaseSecurityGroupId=$databaseSg")
     Deploy-Stack 'aws-3-tier-app' $appTemplate @(
         "InternalALBSecurityGroupId=$internalAlbSg", "AppTierSecurityGroupId=$appSg",
-        "PublicSubnetId=$publicSubnet", "PrivateAppRouteTableAZ1=$privateRouteTable1",
-        "PrivateAppRouteTableAZ2=$privateRouteTable2", "ArtifactVersion=$artifactVersion")
+        "PublicSubnetId=$publicSubnet", "PrivateAppRouteTable=$privateRouteTable",
+        "ArtifactVersion=$artifactVersion")
     Deploy-Stack 'aws-3-tier-web' $webTemplate @(
         "PublicALBSecurityGroupId=$publicAlbSg", "WebTierSecurityGroupId=$webSg",
         "ArtifactVersion=$artifactVersion")

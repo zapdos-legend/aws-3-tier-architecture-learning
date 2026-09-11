@@ -20,12 +20,9 @@ Parameters:
   PublicSubnetId:
     Type: AWS::EC2::Subnet::Id
     Description: Public web subnet used by the low-cost NAT instance.
-  PrivateAppRouteTableAZ1:
+  PrivateAppRouteTable:
     Type: String
-    Description: Route table associated with the first private app subnet.
-  PrivateAppRouteTableAZ2:
-    Type: String
-    Description: Route table associated with the second private app subnet.
+    Description: Route table shared by both private app subnets.
   ArtifactVersion:
     Type: String
     Description: Unique object version (normally the Git commit) uploaded by deploy.ps1.
@@ -126,20 +123,12 @@ Resources:
         - Key: Name
           Value: aws-3-tier-learning-nat-instance
 
-  # Both private app subnet route tables use the same inexpensive NAT instance.
-  AppDefaultRouteAZ1:
+  # The route table shared by both private app subnets uses the inexpensive NAT instance.
+  AppDefaultRoute:
     Type: AWS::EC2::Route
     DependsOn: NatInstance
     Properties:
-      RouteTableId: !Ref PrivateAppRouteTableAZ1
-      DestinationCidrBlock: 0.0.0.0/0
-      InstanceId: !Ref NatInstance
-
-  AppDefaultRouteAZ2:
-    Type: AWS::EC2::Route
-    DependsOn: NatInstance
-    Properties:
-      RouteTableId: !Ref PrivateAppRouteTableAZ2
+      RouteTableId: !Ref PrivateAppRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       InstanceId: !Ref NatInstance
 
@@ -255,7 +244,7 @@ Resources:
   # One instance keeps costs low; two subnets make later scaling exercises simple.
   AppAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
-    DependsOn: [AppDefaultRouteAZ1, AppDefaultRouteAZ2]
+    DependsOn: AppDefaultRoute
     Properties:
       MinSize: '1'
       DesiredCapacity: '1'
