@@ -35,10 +35,18 @@ function Deploy-DatabaseStack([string]$Path, [string]$Username, [SecureString]$P
     try {
         $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
         $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
-        $parameterJson = @{ DBUsername = $Username; DBPassword = $plainPassword; DatabaseSecurityGroupId = $SecurityGroupId } |
-            ConvertTo-Json -Compress
+        # cloudformation deploy models --parameter-overrides as a list of Key=Value
+        # strings. AWS CLI v2 can load that list from a JSON file, leaving only the
+        # non-sensitive file name visible in the process arguments.
+        $parameterValues = @(
+            "DBUsername=$Username"
+            "DBPassword=$plainPassword"
+            "DatabaseSecurityGroupId=$SecurityGroupId"
+        )
+        $parameterJson = ConvertTo-Json -InputObject $parameterValues -Compress
         [IO.File]::WriteAllText($parameterFile, $parameterJson, [Text.UTF8Encoding]::new($false))
         Remove-Variable plainPassword -ErrorAction SilentlyContinue
+        Remove-Variable parameterValues -ErrorAction SilentlyContinue
         Remove-Variable parameterJson -ErrorAction SilentlyContinue
 
         Write-Host 'Deploying aws-3-tier-database (sensitive output hidden) ...' -ForegroundColor Green
@@ -55,6 +63,7 @@ function Deploy-DatabaseStack([string]$Path, [string]$Username, [SecureString]$P
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
         }
         Remove-Variable plainPassword -ErrorAction SilentlyContinue
+        Remove-Variable parameterValues -ErrorAction SilentlyContinue
         Remove-Variable parameterJson -ErrorAction SilentlyContinue
         foreach ($file in @($parameterFile, $stdoutFile, $stderrFile)) {
             if (Test-Path -LiteralPath $file) {
