@@ -24,6 +24,48 @@ function Deploy-Stack([string]$Name, [string]$Path, [string[]]$Parameters = @())
     Invoke-Aws @args
 }
 
+function Deploy-DatabaseStack([string]$Path, [string]$Username, [SecureString]$Password, [string]$SecurityGroupId) {
+    # A temporary parameter file keeps the password out of the process command line.
+    # AWS output is suppressed for this one operation so neither native errors nor
+    # PowerShell exceptions can reproduce a rejected parameter value.
+    $parameterFile = Join-Path ([IO.Path]::GetTempPath()) ("aws-3-tier-db-{0}.json" -f [guid]::NewGuid())
+    $stdoutFile = "$parameterFile.stdout"
+    $stderrFile = "$parameterFile.stderr"
+    $pointer = [IntPtr]::Zero
+    try {
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+        $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+        $parameterJson = @{ DBUsername = $Username; DBPassword = $plainPassword; DatabaseSecurityGroupId = $SecurityGroupId } |
+            ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($parameterFile, $parameterJson, [Text.UTF8Encoding]::new($false))
+        Remove-Variable plainPassword -ErrorAction SilentlyContinue
+        Remove-Variable parameterJson -ErrorAction SilentlyContinue
+
+        Write-Host 'Deploying aws-3-tier-database (sensitive output hidden) ...' -ForegroundColor Green
+        & aws cloudformation deploy --stack-name aws-3-tier-database --template-file $Path `
+            --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM `
+            --parameter-overrides "file://$parameterFile" --profile $AwsProfile --region $Region `
+            1>$stdoutFile 2>$stderrFile
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Database stack deployment failed. Review the CloudFormation stack events in the AWS console; sensitive CLI output was intentionally hidden.'
+        }
+    }
+    finally {
+        if ($pointer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+        }
+        Remove-Variable plainPassword -ErrorAction SilentlyContinue
+        Remove-Variable parameterJson -ErrorAction SilentlyContinue
+        foreach ($file in @($parameterFile, $stdoutFile, $stderrFile)) {
+            if (Test-Path -LiteralPath $file) {
+                # Best effort overwrite before removal; the files live only for this command.
+                Set-Content -LiteralPath $file -Value '' -NoNewline -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 function Get-StackResourceId([string]$Stack, [string]$LogicalId) {
     $value = & aws cloudformation describe-stack-resource --stack-name $Stack `
         --logical-resource-id $LogicalId --query 'StackResourceDetail.PhysicalResourceId' `
@@ -54,6 +96,24 @@ function Get-Export([string]$Name) {
     return $value.Trim()
 }
 
+function Wait-TargetGroupHealthy([string]$Name, [string]$TargetGroupArn, [int]$TimeoutMinutes = 30) {
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    Write-Host "Waiting for the $Name target group to become healthy ..." -ForegroundColor Cyan
+    while ((Get-Date) -lt $deadline) {
+        $states = & aws elbv2 describe-target-health --target-group-arn $TargetGroupArn `
+            --query 'TargetHealthDescriptions[].TargetHealth.State' --output text `
+            --profile $AwsProfile --region $Region
+        if ($LASTEXITCODE -ne 0) { throw "Could not read $Name target health." }
+        $stateList = @($states -split '\s+' | Where-Object { $_ })
+        if ($stateList.Count -gt 0 -and @($stateList | Where-Object { $_ -ne 'healthy' }).Count -eq 0) {
+            Write-Host "$Name target group is healthy." -ForegroundColor Green
+            return
+        }
+        Start-Sleep -Seconds 15
+    }
+    throw "$Name target group did not become healthy within $TimeoutMinutes minutes. Check target health and EC2 user-data logs."
+}
+
 function Get-SubnetRouteTable([string]$SubnetId) {
     $value = & aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=$SubnetId" `
         --query 'RouteTables[0].RouteTableId' --output text --profile $AwsProfile --region $Region
@@ -70,7 +130,7 @@ $databaseTemplate = Join-Path $Root 'infrastructure/03-database.yaml'
 $appTemplate = Join-Path $Root 'infrastructure/04-app-tier.yaml'
 $webTemplate = Join-Path $Root 'infrastructure/05-web-tier.yaml'
 
-foreach ($template in @($artifactTemplate, $databaseTemplate, $appTemplate, $webTemplate)) {
+foreach ($template in @($networkTemplate, $securityTemplate, $artifactTemplate, $databaseTemplate, $appTemplate, $webTemplate)) {
     if (-not (Test-Path $template)) { throw "Required project template not found: $template" }
     Test-Template $template
 }
@@ -90,10 +150,8 @@ function Initialize-BaseStack([string]$Name, [string]$Path) {
 
 $dbUsername = Read-Host 'Database master username'
 $securePassword = Read-Host 'Database master password' -AsSecureString
-$passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
 $artifactDirectory = $null
 try {
-    $dbPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointer)
     Initialize-BaseStack 'aws-3-tier-network' $networkTemplate
     Initialize-BaseStack 'aws-3-tier-security' $securityTemplate
     Deploy-Stack 'aws-3-tier-artifacts' $artifactTemplate
@@ -127,8 +185,7 @@ try {
     $publicAlbSg = Get-StackResourceId 'aws-3-tier-security' 'PublicALBSecurityGroup'
     $webSg = Get-StackResourceId 'aws-3-tier-security' 'WebTierSecurityGroup'
 
-    Deploy-Stack 'aws-3-tier-database' $databaseTemplate @(
-        "DBUsername=$dbUsername", "DBPassword=$dbPassword", "DatabaseSecurityGroupId=$databaseSg")
+    Deploy-DatabaseStack $databaseTemplate $dbUsername $securePassword $databaseSg
     Deploy-Stack 'aws-3-tier-app' $appTemplate @(
         "InternalALBSecurityGroupId=$internalAlbSg", "AppTierSecurityGroupId=$appSg",
         "PublicSubnetId=$publicSubnet", "PrivateAppRouteTable=$privateRouteTable",
@@ -138,13 +195,14 @@ try {
         "ArtifactVersion=$artifactVersion")
 }
 finally {
-    if ($passwordPointer -ne [IntPtr]::Zero) {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
-    }
-    Remove-Variable dbPassword -ErrorAction SilentlyContinue
     if ($null -ne $artifactDirectory) {
         Remove-Item -Recurse -Force $artifactDirectory -ErrorAction SilentlyContinue
     }
 }
 
-Write-Host 'All project stacks deployed successfully.' -ForegroundColor Green
+$appTargetGroup = Get-StackOutput 'aws-3-tier-app' 'AppTargetGroupArn'
+$webTargetGroup = Get-StackResourceId 'aws-3-tier-web' 'WebTargetGroup'
+Wait-TargetGroupHealthy 'app-tier' $appTargetGroup
+Wait-TargetGroupHealthy 'web-tier' $webTargetGroup
+$publicUrl = Get-StackOutput 'aws-3-tier-web' 'PublicLoadBalancerUrl'
+Write-Host "DEMO READY: $publicUrl" -ForegroundColor Green

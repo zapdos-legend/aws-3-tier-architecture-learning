@@ -45,4 +45,36 @@ foreach ($stack in $stacks) {
     Write-Host "Deleted $stack." -ForegroundColor Green
 }
 
-Write-Host 'Project stack cleanup complete. No unrelated resources were targeted.' -ForegroundColor Green
+function Assert-NoResults([string]$Description, [string[]]$Arguments) {
+    $result = & aws @Arguments --profile $AwsProfile --region $Region
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not verify removal of project $Description."
+    }
+    if (-not [string]::IsNullOrWhiteSpace(($result | Out-String).Trim())) {
+        throw "Cleanup verification found project $Description still present: $result"
+    }
+    Write-Host "Verified: no project $Description remains." -ForegroundColor Green
+}
+
+Write-Host 'Verifying chargeable project resources are gone ...' -ForegroundColor Cyan
+Assert-NoResults 'load balancer' @(
+    'elbv2', 'describe-load-balancers', '--query',
+    "LoadBalancers[?LoadBalancerName=='aws-3-tier-public-alb' || LoadBalancerName=='aws-3-tier-internal-alb'].LoadBalancerArn",
+    '--output', 'text')
+Assert-NoResults 'NAT Gateway' @(
+    'ec2', 'describe-nat-gateways', '--filter', 'Name=tag:Name,Values=aws-3-tier-learning-nat-gateway',
+    '--query', "NatGateways[?State!='deleted'].NatGatewayId", '--output', 'text')
+Assert-NoResults 'running or stopped EC2 instance' @(
+    'ec2', 'describe-instances', '--filters',
+    'Name=tag:Name,Values=aws-3-tier-app,aws-3-tier-web',
+    'Name=instance-state-name,Values=pending,running,shutting-down,stopping,stopped',
+    '--query', 'Reservations[].Instances[].InstanceId', '--output', 'text')
+Assert-NoResults 'Elastic IP' @(
+    'ec2', 'describe-addresses', '--filters', 'Name=tag:Name,Values=aws-3-tier-learning-nat-eip',
+    '--query', 'Addresses[].AllocationId', '--output', 'text')
+Assert-NoResults 'RDS database' @(
+    'resourcegroupstaggingapi', 'get-resources', '--tag-filters', 'Key=Name,Values=aws-3-tier-mysql',
+    '--resource-type-filters', 'rds:db', '--query', 'ResourceTagMappingList[].ResourceARN', '--output', 'text')
+
+Write-Host 'DEMO STOPPED / CHARGEABLE PROJECT RESOURCES REMOVED' -ForegroundColor Green
+Write-Host 'All six project stacks, including the project secret and artifact bucket, were removed. No unrelated resources were targeted.' -ForegroundColor Green
