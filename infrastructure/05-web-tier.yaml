@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Public NGINX/React web tier and internet-facing ALB for the AWS three-tier learning project.
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AWS-maintained latest Amazon Linux 2023 x86_64 AMI.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+    Description: Small burstable instance type for this learning environment.
+  WebBuildUrl:
+    Type: String
+    Default: ''
+    Description: Optional HTTPS URL of a tar.gz containing the React build output (never credentials).
+    AllowedPattern: '^$|https://.*'
+  PublicALBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID of PublicALBSecurityGroup from aws-3-tier-security.
+  WebTierSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID of WebTierSecurityGroup from aws-3-tier-security.
+
+Conditions:
+  HasWebBuild: !Not [!Equals [!Ref WebBuildUrl, '']]
+
+Resources:
+  # The web role grants only Session Manager permissions; no S3 access is needed because
+  # an optional build artifact is fetched from the caller-provided HTTPS URL.
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WebInstanceRole]
+
+  # This ALB is the only public entry point for browser traffic.
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: aws-3-tier-public-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref PublicALBSecurityGroupId
+      Subnets:
+        - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ1
+        - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ2
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: aws-3-tier-VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+
+  PublicListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PublicLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # User data installs NGINX, optionally unpacks a pre-built React artifact, and applies
+  # the same SPA fallback/API proxy concepts as application/nginx.conf.
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt WebInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebTierSecurityGroupId
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              dnf install -y nginx
+              rm -rf /usr/share/nginx/html/*
+              if [[ "${HasArtifact}" == "true" ]]; then
+                curl --fail --location "${ArtifactUrl}" --output /tmp/web-build.tar.gz
+                tar -xzf /tmp/web-build.tar.gz -C /usr/share/nginx/html
+              else
+                cat >/usr/share/nginx/html/index.html <<'EOF'
+              <!doctype html><title>AWS 3-tier learning app</title><h1>Web tier is healthy</h1><p>Supply WebBuildUrl to install the React build.</p>
+              EOF
+              fi
+              cat >/etc/nginx/conf.d/webapp.conf <<'EOF'
+              server {
+                  listen 80 default_server;
+                  server_name _;
+                  root /usr/share/nginx/html;
+                  index index.html;
+                  location = /health { default_type text/plain; return 200 'healthy\n'; }
+                  location / { try_files $uri $uri/ /index.html; }
+                  location /api/ { proxy_pass http://${InternalAlbDns}:80/; }
+              }
+              EOF
+              systemctl enable --now nginx
+            - HasArtifact: !If [HasWebBuild, 'true', 'false']
+              ArtifactUrl: !Ref WebBuildUrl
+              InternalAlbDns:
+                Fn::ImportValue: aws-3-tier-InternalLoadBalancerDNSName
+
+  # One instance is inexpensive; the launch template and two-subnet ASG are ready
+  # for a later lesson that adds scaling policies or raises desired capacity.
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '1'
+      DesiredCapacity: '1'
+      MaxSize: '2'
+      VPCZoneIdentifier:
+        - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ1
+        - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ2
+      TargetGroupARNs: [!Ref WebTargetGroup]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-web
+          PropagateAtLaunch: true
+
+Outputs:
+  PublicLoadBalancerDNSName:
+    Description: Public URL hostname for the learning application.
+    Value: !GetAtt PublicLoadBalancer.DNSName
+  PublicLoadBalancerUrl:
+    Description: HTTP URL for the public load balancer.
+    Value: !Sub http://${PublicLoadBalancer.DNSName}

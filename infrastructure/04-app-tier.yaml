@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private Node.js app tier with an internal load balancer for the AWS three-tier learning project.
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AWS-maintained latest Amazon Linux 2023 x86_64 AMI.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+    Description: Small burstable instance type for this learning environment.
+  InternalALBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID of InternalALBSecurityGroup from aws-3-tier-security.
+  AppTierSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID of AppTierSecurityGroup from aws-3-tier-security.
+
+Resources:
+  # Session Manager replaces SSH keys and inbound port 22 access.
+  AppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-app-role
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AppInstanceRole]
+
+  # The internal ALB accepts traffic only through the existing internal-ALB security group.
+  InternalLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: aws-3-tier-internal-alb
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref InternalALBSecurityGroupId
+      Subnets:
+        - Fn::ImportValue: aws-3-tier-PrivateAppSubnetAZ1
+        - Fn::ImportValue: aws-3-tier-PrivateAppSubnetAZ2
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-internal-alb
+
+  # Port 4000 and /health match the existing Express application.
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: aws-3-tier-VpcId
+      Protocol: HTTP
+      Port: 4000
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckPort: '4000'
+      Matcher:
+        HttpCode: '200'
+
+  InternalListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  # A launch template makes it easy to replace instances and later tune scaling.
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt AppInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppTierSecurityGroupId
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              # IMPORTANT: these private subnets intentionally have no NAT Gateway.
+              # Installing supported Node.js 22 and npm packages from internet repositories
+              # requires temporary egress, VPC endpoints where supported, or (preferred)
+              # a custom AL2023 AMI with Node.js 22, the app, and dependencies pre-baked.
+              # The following runs only when that software has been pre-baked at /opt/webapp.
+              if [[ -f /opt/webapp/app-tier/index.js && -x /usr/bin/node ]]; then
+                mkdir -p /etc/aws-3-tier
+                cat >/etc/systemd/system/aws-3-tier-app.service <<'EOF'
+              [Unit]
+              Description=AWS three-tier Node.js application
+              After=network.target
+              [Service]
+              Type=simple
+              User=ec2-user
+              WorkingDirectory=/opt/webapp/app-tier
+              Environment=DB_HOST=${DatabaseHost}
+              Environment=DB_DATABASE=webappdb
+              # Add DB_USER and DB_PWD locally through Session Manager; do not bake secrets.
+              EnvironmentFile=-/etc/aws-3-tier/database.env
+              ExecStart=/usr/bin/node index.js
+              Restart=always
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+                systemctl daemon-reload
+                systemctl enable --now aws-3-tier-app
+              fi
+              # SSM also needs outbound HTTPS connectivity (NAT or SSM interface endpoints).
+            - DatabaseHost:
+                Fn::ImportValue: aws-3-tier-DatabaseEndpoint
+
+  # One instance keeps costs low; two subnets make later scaling exercises simple.
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '1'
+      DesiredCapacity: '1'
+      MaxSize: '2'
+      VPCZoneIdentifier:
+        - Fn::ImportValue: aws-3-tier-PrivateAppSubnetAZ1
+        - Fn::ImportValue: aws-3-tier-PrivateAppSubnetAZ2
+      TargetGroupARNs: [!Ref AppTargetGroup]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-app
+          PropagateAtLaunch: true
+
+Outputs:
+  InternalLoadBalancerDNSName:
+    Description: Private DNS name used by NGINX to reach the app tier.
+    Value: !GetAtt InternalLoadBalancer.DNSName
+    Export:
+      Name: aws-3-tier-InternalLoadBalancerDNSName
+  AppTargetGroupArn:
+    Description: Target group for app instances listening on port 4000.
+    Value: !Ref AppTargetGroup
