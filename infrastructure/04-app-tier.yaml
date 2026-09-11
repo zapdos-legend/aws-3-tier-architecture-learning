@@ -35,6 +35,7 @@ Resources:
   AppInstanceRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: aws-3-tier-app-role
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -71,6 +72,7 @@ Resources:
   AppInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
+      InstanceProfileName: aws-3-tier-app-instance-profile
       Roles: [!Ref AppInstanceRole]
 
   # A single t3.nano NAT *instance* provides temporary learning-environment egress

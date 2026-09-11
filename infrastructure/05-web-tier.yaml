@@ -26,6 +26,7 @@ Resources:
   WebInstanceRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: aws-3-tier-web-role
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -55,6 +56,7 @@ Resources:
   WebInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
+      InstanceProfileName: aws-3-tier-web-instance-profile
       Roles: [!Ref WebInstanceRole]
 
   # This ALB is the only public entry point for browser traffic.
