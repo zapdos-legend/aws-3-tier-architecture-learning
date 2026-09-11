@@ -1,0 +1,35 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Small S3 bucket used only to transfer local application source to the learning EC2 instances.
+
+Resources:
+  # S3 is used as a deployment transport so application source does not need to be
+  # duplicated in UserData or hosted in a separate public repository.
+  ApplicationArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: RemoveOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-application-artifacts
+
+Outputs:
+  ArtifactsBucketName:
+    Description: Private bucket populated by deploy.ps1 with the local application source.
+    Value: !Ref ApplicationArtifactsBucket
+    Export:
+      Name: aws-3-tier-ApplicationArtifactsBucket

@@ -28,7 +28,7 @@ app.post('/transaction', (req,res)=>{
         console.log(req.body.amount);
         console.log(req.body.desc);
         var success = transactionService.addTransaction(req.body.amount,req.body.desc);
-        if (success = 200) res.json({ message: 'added transaction successfully'});
+        if (success === 200) res.json({ message: 'added transaction successfully'});
     }catch (err){
         res.json({ message: 'something went wrong', error : err.message});
     }

@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private Node.js app tier with an internal load balancer for the AWS three-tier learning project.
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AWS-maintained latest Amazon Linux 2023 x86_64 AMI.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+    Description: Small burstable instance type for this learning environment.
+  InternalALBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID of InternalALBSecurityGroup from aws-3-tier-security.
+  AppTierSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID of AppTierSecurityGroup from aws-3-tier-security.
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public web subnet used by the low-cost NAT instance.
+  PrivateAppRouteTableAZ1:
+    Type: String
+    Description: Route table associated with the first private app subnet.
+  PrivateAppRouteTableAZ2:
+    Type: String
+    Description: Route table associated with the second private app subnet.
+  ArtifactVersion:
+    Type: String
+    Description: Unique object version (normally the Git commit) uploaded by deploy.ps1.
+
+Resources:
+  # Session Manager replaces SSH keys and inbound port 22 access.
+  AppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadApplicationBootstrapData
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - ${BucketArn}/app-tier/${ArtifactVersion}.zip
+                  - BucketArn:
+                      Fn::Join:
+                        - ''
+                        - - 'arn:'
+                          - !Ref AWS::Partition
+                          - ':s3:::'
+                          - Fn::ImportValue: aws-3-tier-ApplicationArtifactsBucket
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Fn::ImportValue: aws-3-tier-DatabaseSecretArn
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-app-role
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AppInstanceRole]
+
+  # A single t3.nano NAT *instance* provides temporary learning-environment egress
+  # without the fixed hourly cost of a managed NAT Gateway. It is deliberately not
+  # highly available and is a single point of failure; production should use managed NAT.
+  NatInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow private VPC instances to use the NAT instance
+      VpcId:
+        Fn::ImportValue: aws-3-tier-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: '-1'
+          CidrIp: 10.0.0.0/16
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  NatInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.nano
+      SourceDestCheck: false
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet: [!Ref NatInstanceSecurityGroup]
+          SubnetId: !Ref PublicSubnetId
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          echo 'net.ipv4.ip_forward = 1' >/etc/sysctl.d/90-nat.conf
+          sysctl --system
+          dnf install -y iptables-services
+          iptables -t nat -A POSTROUTING -o ens5 -j MASQUERADE
+          iptables-save >/etc/sysconfig/iptables
+          systemctl enable --now iptables
+          /opt/aws/bin/cfn-signal --exit-code $? --stack ${AWS::StackName} \
+            --resource NatInstance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-learning-nat-instance
+
+  # Both private app subnet route tables use the same inexpensive NAT instance.
+  AppDefaultRouteAZ1:
+    Type: AWS::EC2::Route
+    DependsOn: NatInstance
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTableAZ1
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NatInstance
+
+  AppDefaultRouteAZ2:
+    Type: AWS::EC2::Route
+    DependsOn: NatInstance
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTableAZ2
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NatInstance
+
+  # The internal ALB accepts traffic only through the existing internal-ALB security group.
+  InternalLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: aws-3-tier-internal-alb
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref InternalALBSecurityGroupId
+      Subnets:
+        - Fn::ImportValue: aws-3-tier-PrivateAppSubnetAZ1
+        - Fn::ImportValue: aws-3-tier-PrivateAppSubnetAZ2
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-internal-alb
+
+  # Port 4000 and /health match the existing Express application.
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: aws-3-tier-VpcId
+      Protocol: HTTP
+      Port: 4000
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckPort: '4000'
+      Matcher:
+        HttpCode: '200'
+
+  InternalListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  # A launch template makes it easy to replace instances and later tune scaling.
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt AppInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppTierSecurityGroupId
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              # Private instances use the stack's small NAT instance for bootstrapping;
+              # no managed NAT Gateway or pre-baked AMI is required.
+              dnf install -y unzip
+              curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+              dnf install -y nodejs
+              mkdir -p /opt/webapp/app-tier /etc/aws-3-tier
+              aws s3 cp "s3://${ArtifactBucket}/app-tier/${ArtifactVersion}.zip" /tmp/app-tier.zip
+              unzip -q /tmp/app-tier.zip -d /opt/webapp/app-tier
+              cd /opt/webapp/app-tier
+              npm install --omit=dev
+              aws secretsmanager get-secret-value --secret-id "${DatabaseSecret}" \
+                --query SecretString --output text >/run/database-secret.json
+              python3 - <<'PY'
+              import json, shlex
+              with open('/run/database-secret.json', encoding='utf-8') as source:
+                  secret = json.load(source)
+              with open('/etc/aws-3-tier/database.env', 'w', encoding='utf-8') as target:
+                  target.write('DB_USER=' + shlex.quote(secret['username']) + '\n')
+                  target.write('DB_PWD=' + shlex.quote(secret['password']) + '\n')
+              PY
+              chmod 600 /etc/aws-3-tier/database.env
+              rm -f /run/database-secret.json /tmp/app-tier.zip
+              cat >/etc/systemd/system/aws-3-tier-app.service <<'EOF'
+              [Unit]
+              Description=AWS three-tier Node.js application
+              After=network.target
+              [Service]
+              Type=simple
+              User=ec2-user
+              WorkingDirectory=/opt/webapp/app-tier
+              Environment=DB_HOST=${DatabaseHost}
+              Environment=DB_DATABASE=webappdb
+              # Credentials are written at boot from the encrypted Secrets Manager value.
+              EnvironmentFile=-/etc/aws-3-tier/database.env
+              ExecStart=/usr/bin/node index.js
+              Restart=always
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              systemctl daemon-reload
+              systemctl enable --now aws-3-tier-app
+            - DatabaseHost:
+                Fn::ImportValue: aws-3-tier-DatabaseEndpoint
+              DatabaseSecret:
+                Fn::ImportValue: aws-3-tier-DatabaseSecretArn
+              ArtifactBucket:
+                Fn::ImportValue: aws-3-tier-ApplicationArtifactsBucket
+              ArtifactVersion: !Ref ArtifactVersion
+
+  # One instance keeps costs low; two subnets make later scaling exercises simple.
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [AppDefaultRouteAZ1, AppDefaultRouteAZ2]
+    Properties:
+      MinSize: '1'
+      DesiredCapacity: '1'
+      MaxSize: '2'
+      VPCZoneIdentifier:
+        - Fn::ImportValue: aws-3-tier-PrivateAppSubnetAZ1
+        - Fn::ImportValue: aws-3-tier-PrivateAppSubnetAZ2
+      TargetGroupARNs: [!Ref AppTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 900
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-app
+          PropagateAtLaunch: true
+
+Outputs:
+  InternalLoadBalancerDNSName:
+    Description: Private DNS name used by NGINX to reach the app tier.
+    Value: !GetAtt InternalLoadBalancer.DNSName
+    Export:
+      Name: aws-3-tier-InternalLoadBalancerDNSName
+  AppTargetGroupArn:
+    Description: Target group for app instances listening on port 4000.
+    Value: !Ref AppTargetGroup

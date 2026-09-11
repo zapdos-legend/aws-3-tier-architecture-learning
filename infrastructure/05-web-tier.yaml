@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Public NGINX/React web tier and internet-facing ALB for the AWS three-tier learning project.
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AWS-maintained latest Amazon Linux 2023 x86_64 AMI.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+    Description: Small burstable instance type for this learning environment.
+  ArtifactVersion:
+    Type: String
+    Description: Unique object version (normally the Git commit) uploaded by deploy.ps1.
+  PublicALBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID of PublicALBSecurityGroup from aws-3-tier-security.
+  WebTierSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID of WebTierSecurityGroup from aws-3-tier-security.
+
+Resources:
+  # The web role grants Session Manager plus read access to exactly one source archive.
+  WebInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadWebSourceArtifact
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - ${BucketArn}/web-tier/${ArtifactVersion}.zip
+                  - BucketArn:
+                      Fn::Join:
+                        - ''
+                        - - 'arn:'
+                          - !Ref AWS::Partition
+                          - ':s3:::'
+                          - Fn::ImportValue: aws-3-tier-ApplicationArtifactsBucket
+
+  WebInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WebInstanceRole]
+
+  # This ALB is the only public entry point for browser traffic.
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: aws-3-tier-public-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref PublicALBSecurityGroupId
+      Subnets:
+        - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ1
+        - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ2
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: aws-3-tier-VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: '200'
+
+  PublicListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PublicLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # User data installs NGINX, optionally unpacks a pre-built React artifact, and applies
+  # the same SPA fallback/API proxy concepts as application/nginx.conf.
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt WebInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebTierSecurityGroupId
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              dnf install -y nginx unzip
+              curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+              dnf install -y nodejs
+              mkdir -p /opt/webapp/web-tier
+              aws s3 cp "s3://${ArtifactBucket}/web-tier/${ArtifactVersion}.zip" /tmp/web-tier.zip
+              unzip -q /tmp/web-tier.zip -d /opt/webapp/web-tier
+              cd /opt/webapp/web-tier
+              npm ci
+              # CRA 5's legacy ESLint integration is not needed for the production bundle;
+              # lint/test checks are run before deployment by this repository.
+              DISABLE_ESLINT_PLUGIN=true npm run build
+              rm -rf /usr/share/nginx/html/*
+              cp -a build/. /usr/share/nginx/html/
+              cat >/etc/nginx/nginx.conf <<'EOF'
+              user nginx;
+              worker_processes auto;
+              error_log /var/log/nginx/error.log;
+              pid /run/nginx.pid;
+              events { worker_connections 1024; }
+              http {
+                include /etc/nginx/mime.types;
+                default_type application/octet-stream;
+                sendfile on;
+              server {
+                listen 80 default_server;
+                server_name _;
+                root /usr/share/nginx/html;
+                index index.html;
+                location = /health { default_type text/plain; return 200 'healthy\n'; }
+                location / { try_files $uri $uri/ /index.html; }
+                # The trailing slash deliberately strips /api/ before forwarding;
+                # /api/transaction therefore reaches the app's /transaction route.
+                location /api/ {
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_pass http://${InternalAlbDns}:80/;
+                }
+              }
+              }
+              EOF
+              systemctl enable --now nginx
+            - InternalAlbDns:
+                Fn::ImportValue: aws-3-tier-InternalLoadBalancerDNSName
+              ArtifactBucket:
+                Fn::ImportValue: aws-3-tier-ApplicationArtifactsBucket
+              ArtifactVersion: !Ref ArtifactVersion
+
+  # One instance is inexpensive; the launch template and two-subnet ASG are ready
+  # for a later lesson that adds scaling policies or raises desired capacity.
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '1'
+      DesiredCapacity: '1'
+      MaxSize: '2'
+      VPCZoneIdentifier:
+        - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ1
+        - Fn::ImportValue: aws-3-tier-PublicWebSubnetAZ2
+      TargetGroupARNs: [!Ref WebTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 1200
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-web
+          PropagateAtLaunch: true
+
+Outputs:
+  PublicLoadBalancerDNSName:
+    Description: Public URL hostname for the learning application.
+    Value: !GetAtt PublicLoadBalancer.DNSName
+  PublicLoadBalancerUrl:
+    Description: HTTP URL for the public load balancer.
+    Value: !Sub http://${PublicLoadBalancer.DNSName}

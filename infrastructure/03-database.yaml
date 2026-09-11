@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cost-conscious, private MySQL database for the AWS three-tier learning project.
+
+Parameters:
+  DBUsername:
+    Type: String
+    Description: Master username for MySQL (supply this at deployment time).
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+  DBPassword:
+    Type: String
+    Description: Master password for MySQL (supply this at deployment time).
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[A-Za-z0-9!#$%&()*+,.\-:;<=>?_~]+'
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    AllowedValues: [db.t4g.micro, db.t3.micro]
+    Description: Small burstable instance classes suitable for learning.
+  DatabaseSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: ID of DatabaseSecurityGroup from aws-3-tier-security.
+
+Resources:
+  # The app reads this encrypted secret at boot. This avoids credentials in Git,
+  # EC2 UserData, launch templates, and command-line arguments on the instance.
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Runtime MySQL credentials for the AWS three-tier learning app
+      SecretString: !Sub '{"username":"${DBUsername}","password":"${DBPassword}"}'
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-database-credentials
+
+  # RDS needs a subnet group spanning at least two Availability Zones even though
+  # this first deployment intentionally creates only one database instance in one AZ.
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private database subnets for the three-tier application
+      SubnetIds:
+        - Fn::ImportValue: aws-3-tier-PrivateDBSubnetAZ1
+        - Fn::ImportValue: aws-3-tier-PrivateDBSubnetAZ2
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-database-subnets
+
+  # A small, encrypted, Single-AZ MySQL instance keeps this learning deployment inexpensive.
+  # DeletionPolicy Delete and SkipFinalSnapshot make the stack straightforward to clean up.
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 25
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBName: webappdb
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroupId
+      BackupRetentionPeriod: 0
+      DeleteAutomatedBackups: true
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+      EnableIAMDatabaseAuthentication: false
+      Tags:
+        - Key: Name
+          Value: aws-3-tier-mysql
+
+Outputs:
+  DatabaseEndpoint:
+    Description: DNS endpoint used by the app tier to connect to MySQL.
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: aws-3-tier-DatabaseEndpoint
+  DatabasePort:
+    Description: TCP port used by MySQL.
+    Value: !GetAtt Database.Endpoint.Port
+    Export:
+      Name: aws-3-tier-DatabasePort
+  DatabaseSecretArn:
+    Description: Secret read by the app instance role at startup.
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: aws-3-tier-DatabaseSecretArn
